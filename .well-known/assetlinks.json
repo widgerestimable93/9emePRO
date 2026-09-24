@@ -1,0 +1,10 @@
+[{
+  "relation": ["delegate_permission/common.handle_all_urls"],
+  "target": {
+    "namespace": "android_app",
+    "package_name": "io.github.widgerestimable557_cpu.twa",
+    "sha256_cert_fingerprints": [
+      "72:28:CE:63:DB:2D:1B:07:F7:4F:98:4B:4A:1A:7F:B0:EE:29:6A:99:B1:00:57:4A:0F:DB:18:DD:CD:0A:3D:41"
+    ]
+  }
+}]
