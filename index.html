@@ -897,6 +897,10 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
 </div>
 
 <script>
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('./sw.js').catch(function(e){ console.warn('SW non enregistre:', e); });
+}
+
 // ════════════════════════════════════════════════════════
 // PONT google.script.run → Web App Apps Script (JSONP)
 // Permet à cette page, hébergée sur GitHub Pages, de parler
@@ -988,6 +992,260 @@ var App = {
 };
 
 // ════════════════════════════════════════════════════════
+// MODE HORS-LIGNE — à coller juste après le bloc App = {...}
+// Utilise le même pont google.script.run (JSONP) déjà en place,
+// donc aucune nouvelle fonction d'appel réseau à écrire.
+// ════════════════════════════════════════════════════════
+
+App.offlineMode = false; // true pendant une session de quiz jouée hors-ligne
+
+var DB_NAME = '9emePRO_offline';
+var DB_VERSION = 1;
+var STORE_QUIZ = 'quiz_packs';
+var STORE_PENDING = 'pending_results';
+
+function openOfflineDB() {
+  return new Promise(function (resolve, reject) {
+    var request = indexedDB.open(DB_NAME, DB_VERSION);
+    request.onupgradeneeded = function (event) {
+      var db = event.target.result;
+      if (!db.objectStoreNames.contains(STORE_QUIZ)) db.createObjectStore(STORE_QUIZ, { keyPath: 'matiere' });
+      if (!db.objectStoreNames.contains(STORE_PENDING)) db.createObjectStore(STORE_PENDING, { keyPath: 'localId' });
+    };
+    request.onsuccess = function (e) { resolve(e.target.result); };
+    request.onerror = function (e) { reject(e.target.error); };
+  });
+}
+
+// ── TÉLÉCHARGEMENT D'UN PACK ────────────────────────────────
+// Appelle ça depuis un bouton "Télécharger [matière] pour hors-ligne"
+function downloadSubjectForOffline(matiere) {
+  if (!App.token) { showToast('Connecte-toi d\'abord.', 'error'); return; }
+  showLoader('Téléchargement de ' + matiere + '…');
+  google.script.run
+    .withSuccessHandler(function (res) {
+      if (!res.success) {
+        hideLoader();
+        showToast(res.message || 'Erreur de téléchargement', 'error');
+        return;
+      }
+      openOfflineDB().then(function (db) {
+        return new Promise(function (resolve, reject) {
+          var tx = db.transaction(STORE_QUIZ, 'readwrite');
+          tx.objectStore(STORE_QUIZ).put({
+            matiere: res.matiere,
+            version: res.version,
+            generatedAt: res.generatedAt,
+            questions: res.questions,
+            downloadedAt: new Date().toISOString()
+          });
+          tx.oncomplete = resolve;
+          tx.onerror = function () { reject(tx.error); };
+        });
+      }).then(function () {
+        hideLoader();
+        showToast(res.total + ' questions de ' + matiere + ' disponibles hors-ligne 📥', 'success');
+      }).catch(function (e) {
+        hideLoader();
+        showToast('Erreur de stockage local: ' + e.message, 'error');
+      });
+    })
+    .withFailureHandler(function (err) {
+      hideLoader();
+      if (err.code === 'PREMIUM_REQUIRED' || err.code === 'AUTH') showPage('payment');
+      showToast(err.message || 'Erreur', 'error');
+    })
+    .getFullQuizPack({ token: App.token, matiere: matiere });
+}
+
+// ── LISTE DES MATIÈRES DÉJÀ TÉLÉCHARGÉES ────────────────────
+// Pour afficher un écran "Mes matières hors-ligne" avec dates.
+function listDownloadedSubjects(onDone) {
+  openOfflineDB().then(function (db) {
+    return new Promise(function (resolve, reject) {
+      var tx = db.transaction(STORE_QUIZ, 'readonly');
+      var req = tx.objectStore(STORE_QUIZ).getAll();
+      req.onsuccess = function () { resolve(req.result); };
+      req.onerror = function () { reject(req.error); };
+    });
+  }).then(function (packs) {
+    onDone(packs.map(function (p) {
+      return { matiere: p.matiere, downloadedAt: p.downloadedAt, questionCount: p.questions.length };
+    }));
+  }).catch(function () { onDone([]); });
+}
+
+// ── LANCER UN QUIZ HORS-LIGNE ────────────────────────────────
+// Remplace loadQuiz() quand l'utilisateur choisit "Jouer hors-ligne"
+// pour une matière déjà téléchargée. Mélange les choix localement,
+// exactement comme _buildQuizResponse le fait côté serveur.
+function startOfflineQuiz(matiere) {
+  showLoader('Préparation du quiz hors-ligne…');
+  openOfflineDB().then(function (db) {
+    return new Promise(function (resolve, reject) {
+      var tx = db.transaction(STORE_QUIZ, 'readonly');
+      var req = tx.objectStore(STORE_QUIZ).get(matiere);
+      req.onsuccess = function () { resolve(req.result); };
+      req.onerror = function () { reject(req.error); };
+    });
+  }).then(function (pack) {
+    hideLoader();
+    if (!pack || !pack.questions.length) {
+      showToast('Aucun pack téléchargé pour ' + matiere + '.', 'error');
+      return;
+    }
+    var pool = shuffleArray(pack.questions).slice(0, Math.min(10, pack.questions.length));
+    App.questions = pool.map(function (q) {
+      var shuffled = shuffleArray(q.choix.slice());
+      var correctText = q.choix[q.correctIndex];
+      var newCorrectIndex = shuffled.indexOf(correctText);
+      return {
+        id: q.id, matiere: q.matiere, niveau: q.niveau, question: q.question,
+        choix: shuffled, _correctText: correctText, explication: q.explication
+      };
+    });
+    App.offlineMode = true;
+    App.quizMatiere = matiere;
+    App.quizSessionId = null; // pas de session serveur en mode offline
+    App.currentQ = 0; App.answers = {}; App.scoreLive = 0;
+    showPage('quiz');
+    renderQuestion();
+  }).catch(function (e) {
+    hideLoader();
+    showToast('Erreur: ' + e.message, 'error');
+  });
+}
+
+function shuffleArray(arr) {
+  var a = arr.slice();
+  for (var i = a.length - 1; i > 0; i--) {
+    var j = Math.floor(Math.random() * (i + 1));
+    var tmp = a[i]; a[i] = a[j]; a[j] = tmp;
+  }
+  return a;
+}
+
+// ── SAUVEGARDE LOCALE D'UN RÉSULTAT + SYNC ──────────────────
+function saveOfflineQuizResult(answers, matiere, tempsSecondes) {
+  return openOfflineDB().then(function (db) {
+    var localId = 'res_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+    var entry = { localId: localId, token: App.token, matiere: matiere, tempsSecondes: tempsSecondes, answers: answers };
+    return new Promise(function (resolve, reject) {
+      var tx = db.transaction(STORE_PENDING, 'readwrite');
+      tx.objectStore(STORE_PENDING).put(entry);
+      tx.oncomplete = function () { resolve(localId); };
+      tx.onerror = function () { reject(tx.error); };
+    });
+  });
+}
+
+// Tente d'envoyer tous les résultats en attente. Appelée au démarrage,
+// sur l'événement 'online', et juste après chaque quiz.
+function trySyncPendingOfflineResults() {
+  if (!navigator.onLine || !App.token) return;
+  openOfflineDB().then(function (db) {
+    return new Promise(function (resolve, reject) {
+      var tx = db.transaction(STORE_PENDING, 'readonly');
+      var req = tx.objectStore(STORE_PENDING).getAll();
+      req.onsuccess = function () { resolve(req.result); };
+      req.onerror = function () { reject(req.error); };
+    });
+  }).then(function (pending) {
+    pending.forEach(function (entry) { syncOneOfflineResult(entry); });
+  }).catch(function () {});
+}
+
+function syncOneOfflineResult(entry) {
+  google.script.run
+    .withSuccessHandler(function (res) {
+      if (!res.success) return; // on réessaiera plus tard, on ne supprime pas
+      openOfflineDB().then(function (db) {
+        var tx = db.transaction(STORE_PENDING, 'readwrite');
+        tx.objectStore(STORE_PENDING).delete(res.localId || entry.localId);
+      });
+      if (App.user) App.user.score_total = res.scoreTotal;
+    })
+    .withFailureHandler(function () { /* échec réseau silencieux, on retentera */ })
+    .submitOfflineQuiz({
+      token: entry.token, matiere: entry.matiere, tempsSecondes: entry.tempsSecondes,
+      localId: entry.localId, answers: entry.answers
+    });
+}
+
+window.addEventListener('online', trySyncPendingOfflineResults);
+
+// ── TÉLÉCHARGEMENT AUTOMATIQUE EN ARRIÈRE-PLAN ──────────────
+// Appelée juste après connexion (login/register/session valide).
+// Télécharge toutes les matières disponibles, une par une, sans
+// bloquer l'UI et sans notification intrusive (juste un léger
+// toast discret une fois que tout est prêt).
+var _autoDownloadInProgress = false;
+function autoDownloadAllSubjectsInBackground() {
+  if (_autoDownloadInProgress || !navigator.onLine || !App.token) return;
+  _autoDownloadInProgress = true;
+
+  google.script.run
+    .withSuccessHandler(function(res) {
+      if (!res.success || !res.subjects || !res.subjects.length) { _autoDownloadInProgress=false; return; }
+      var subjects = res.subjects.map(function(s){ return s.matiere; });
+      _downloadSubjectsSequentially(subjects, 0, 0);
+    })
+    .withFailureHandler(function() { _autoDownloadInProgress=false; })
+    .getOfflineSubjectsInfo({ token: App.token });
+}
+
+function _downloadSubjectsSequentially(subjects, index, downloadedCount) {
+  if (index >= subjects.length) {
+    _autoDownloadInProgress = false;
+    if (downloadedCount > 0) showToast(downloadedCount + ' matière(s) prête(s) hors-ligne 📥','success');
+    return;
+  }
+  var matiere = subjects[index];
+  google.script.run
+    .withSuccessHandler(function(res) {
+      if (res.success) {
+        openOfflineDB().then(function(db) {
+          return new Promise(function(resolve, reject) {
+            var tx = db.transaction(STORE_QUIZ, 'readwrite');
+            tx.objectStore(STORE_QUIZ).put({
+              matiere: res.matiere, version: res.version, generatedAt: res.generatedAt,
+              questions: res.questions, downloadedAt: new Date().toISOString()
+            });
+            tx.oncomplete = resolve;
+            tx.onerror = function(){ reject(tx.error); };
+          });
+        }).then(function() {
+          setTimeout(function(){ _downloadSubjectsSequentially(subjects, index+1, downloadedCount+1); }, 400);
+        }).catch(function() {
+          setTimeout(function(){ _downloadSubjectsSequentially(subjects, index+1, downloadedCount); }, 400);
+        });
+      } else {
+        setTimeout(function(){ _downloadSubjectsSequentially(subjects, index+1, downloadedCount); }, 400);
+      }
+    })
+    .withFailureHandler(function() {
+      setTimeout(function(){ _downloadSubjectsSequentially(subjects, index+1, downloadedCount); }, 400);
+    })
+    .getFullQuizPack({ token: App.token, matiere: matiere });
+}
+
+// Ne re-télécharge une matière que si elle est absente OU si sa
+// version a changé côté serveur (évite de re-télécharger à chaque
+// connexion des données déjà à jour).
+function autoRefreshStaleSubjects() {
+  if (!navigator.onLine || !App.token) return;
+  listDownloadedSubjects(function(local) {
+    var localVersions = {};
+    local.forEach(function(p){ localVersions[p.matiere] = p; });
+    // Le pack le plus simple : on relance juste le téléchargement complet
+    // en tâche de fond ; downloadSubjectForOffline écrase silencieusement
+    // l'ancienne version dans IndexedDB (put() avec la même clé matiere).
+    autoDownloadAllSubjectsInBackground();
+  });
+}
+
+
+// ════════════════════════════════════════════════════════
 // UTILS
 // ════════════════════════════════════════════════════════
 function showToast(msg, type) {
@@ -1017,6 +1275,8 @@ function checkSession() {
         App.user=res.user;
         showPage('dashboard');
         showToast('Bon retour, '+res.user.email.split('@')[0]+' ! 👋','success');
+        trySyncPendingOfflineResults();
+        autoRefreshStaleSubjects();
       }
     })
     .withFailureHandler(function() { splash.classList.add('hidden'); })
@@ -1071,6 +1331,7 @@ function doLogin() {
         if (res.token) saveToken(res.token);
         showToast('Bienvenue ! 👋','success');
         showPage('dashboard');
+        autoDownloadAllSubjectsInBackground();
       } else showError(errEl,res.message);
     })
     .withFailureHandler(function(err) { hideLoader(); showError(errEl,'Erreur: '+err.message); })
@@ -1094,6 +1355,7 @@ function doRegister() {
         if (res.token) saveToken(res.token);
         showToast('Compte créé ! 🎉','success');
         showPage('dashboard');
+        autoDownloadAllSubjectsInBackground();
       } else showError(errEl,res.message);
     })
     .withFailureHandler(function(err) { hideLoader(); showError(errEl,'Erreur: '+err.message); })
@@ -1239,9 +1501,24 @@ function renderQuestion() {
   body.innerHTML=html;
 }
 
+var POINTS_PAR_NIVEAU = { facile:10, moyen:20, difficile:30 };
+
 function answerQuestion(index) {
   if (App.answers[App.currentQ]!==undefined) return;
   var q=App.questions[App.currentQ];
+
+  if (App.offlineMode) {
+    var choiceText = q.choix[index];
+    var isOk = (choiceText === q._correctText);
+    var correctIndex = q.choix.indexOf(q._correctText);
+    var pts = isOk ? (POINTS_PAR_NIVEAU[q.niveau]||10) : 0;
+    App.answers[App.currentQ]={ userIndex:index, correctIndex:correctIndex, isOk:isOk, pts:pts, answerText:choiceText };
+    if (isOk) { App.scoreLive+=pts; showToast('+'+pts+' pts 🎉 (hors-ligne)','success'); }
+    else showToast('Raté… (hors-ligne)','error');
+    renderQuestion();
+    return;
+  }
+
   showLoader('Vérification…');
   google.script.run
     .withSuccessHandler(function(res) {
@@ -1264,6 +1541,35 @@ function prevQuestion() { if (App.currentQ>0) { App.currentQ--; renderQuestion()
 
 function finishQuiz() {
   if (App.timerInterval) { clearInterval(App.timerInterval); App.timerInterval=null; }
+
+  if (App.offlineMode) {
+    var answersOffline=Object.keys(App.answers).map(function(k) {
+      return { questionId: App.questions[parseInt(k)].id, answerText: App.answers[k].answerText };
+    });
+    var correctCount=Object.keys(App.answers).filter(function(k){return App.answers[k].isOk;}).length;
+    var totalScore=Object.keys(App.answers).reduce(function(s,k){return s+App.answers[k].pts;},0);
+    var quizMatiereSnapshot=App.quizMatiere;
+
+    saveOfflineQuizResult(answersOffline, quizMatiereSnapshot, 0).then(function() {
+      showPage('result');
+      var total=App.questions.length;
+      var pct=total?Math.round((correctCount/total)*100):0;
+      var icons=[['🏆',90],['🎓',70],['📈',50],['💪',0]];
+      var icon=(icons.find(function(pair){var t=pair[1];return pct>=t;})||['💪'])[0];
+      document.getElementById('result-icon').textContent=icon;
+      document.getElementById('result-title').textContent=pct>=90?'Excellent !!':pct>=70?'Très bien !':pct>=50?'Pas mal !':'Continue !';
+      document.getElementById('result-pct').textContent=pct+'%';
+      document.getElementById('result-sub').textContent=correctCount+'/'+total+' correctes — Résultat en attente de synchronisation 🔄';
+      document.getElementById('res-correct').textContent=correctCount;
+      document.getElementById('res-wrong').textContent=total-correctCount;
+      document.getElementById('res-pts').textContent=totalScore;
+      showToast('Résultat sauvegardé — sera synchronisé dès que tu seras en ligne 📶','info');
+      trySyncPendingOfflineResults();
+      App.offlineMode=false;
+    });
+    return;
+  }
+
   var answers=Object.keys(App.answers).map(function(k) {
     return {
       questionId: App.questions[parseInt(k)].id,
