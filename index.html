@@ -384,6 +384,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
 }
 .btn-whatsapp:active{transform:scale(.97)}
 </style>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
 
@@ -465,6 +466,10 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
       </div>
       <div class="error-msg" id="login-error"></div>
       <button class="btn btn-primary" onclick="doLogin()" style="margin-top:6px">Connexion →</button>
+      <div style="display:flex;align-items:center;gap:10px;margin:14px 0;color:var(--text-dim,#888);font-size:.8rem">
+        <div style="flex:1;height:1px;background:var(--border2,#333)"></div>ou<div style="flex:1;height:1px;background:var(--border2,#333)"></div>
+      </div>
+      <div id="google-signin-btn" style="display:flex;justify-content:center"></div>
     </div>
     <!-- Register -->
     <div class="auth-form" id="form-register">
@@ -1503,6 +1508,40 @@ function renderQuestion() {
 
 var POINTS_PAR_NIVEAU = { facile:10, moyen:20, difficile:30 };
 
+// Tente une correction 100% locale (zéro réseau, zéro spinner) en
+// cherchant la question dans un pack déjà téléchargé pour SA matière
+// (q.matiere, pas App.quizMatiere qui peut valoir 'toutes'). On compare
+// par TEXTE de réponse, pas par index, car l'ordre des choix affiché
+// ici (mélangé par le serveur pour cette session) diffère de l'ordre
+// stocké dans le pack local. callback(null) si rien trouvé localement.
+function tryInstantLocalGrade(q, choiceText, callback) {
+  openOfflineDB().then(function(db) {
+    var tx=db.transaction(STORE_QUIZ,'readonly');
+    var req=tx.objectStore(STORE_QUIZ).get(q.matiere);
+    req.onsuccess=function() {
+      var pack=req.result;
+      if (!pack) { callback(null); return; }
+      var match=pack.questions.find(function(pq){ return pq.id===q.id; });
+      if (!match) { callback(null); return; }
+      var correctText=match.choix[match.correctIndex];
+      var isOk=(choiceText===correctText);
+      var correctIndexInCurrent=q.choix.indexOf(correctText);
+      var pts=isOk?(POINTS_PAR_NIVEAU[q.niveau]||10):0;
+      callback({ isOk:isOk, correctIndex: correctIndexInCurrent>=0?correctIndexInCurrent:-1, pts:pts });
+    };
+    req.onerror=function(){ callback(null); };
+  }).catch(function(){ callback(null); });
+}
+
+// Indicateur discret pendant l'appel réseau de secours (fallback),
+// utilisé seulement quand aucun pack local ne permet la correction
+// instantanée. Remplace le spinner plein écran par un simple état
+// "désactivé + curseur d'attente" sur les boutons de choix.
+function setAnswerButtonsBusy(busy) {
+  var buttons=document.querySelectorAll('#quiz-body .choice-btn');
+  buttons.forEach(function(b){ b.disabled=busy; b.style.opacity=busy?'.55':''; b.style.cursor=busy?'wait':''; });
+}
+
 function answerQuestion(index) {
   if (App.answers[App.currentQ]!==undefined) return;
   var q=App.questions[App.currentQ];
@@ -1519,18 +1558,32 @@ function answerQuestion(index) {
     return;
   }
 
-  showLoader('Vérification…');
-  google.script.run
-    .withSuccessHandler(function(res) {
-      hideLoader();
-      if (!res.success) { showToast(res.message||'Erreur','error'); return; }
-      App.answers[App.currentQ]={ userIndex:index, correctIndex:res.correctIndex, isOk:res.correct, pts:res.pts };
-      if (res.correct) { App.scoreLive+=res.pts; showToast('+'+res.pts+' pts 🎉','success'); }
+  var choiceText = q.choix[index];
+  tryInstantLocalGrade(q, choiceText, function(local) {
+    if (local) {
+      // Correction instantanée : aucun aller-retour réseau, aucun spinner.
+      App.answers[App.currentQ]={ userIndex:index, correctIndex:local.correctIndex, isOk:local.isOk, pts:local.pts };
+      if (local.isOk) { App.scoreLive+=local.pts; showToast('+'+local.pts+' pts 🎉','success'); }
       else showToast('Raté… La bonne réponse s\'affiche.','error');
       renderQuestion();
-    })
-    .withFailureHandler(function(err) { hideLoader(); showToast('Erreur: '+err.message,'error'); })
-    .checkAnswer({quizSessionId:App.quizSessionId, questionId:q.id, answerIndex:index, niveau:q.niveau});
+      return;
+    }
+
+    // Pas de pack local pour cette question : fallback réseau, avec un
+    // indicateur léger au lieu du spinner plein écran (plus fluide).
+    setAnswerButtonsBusy(true);
+    google.script.run
+      .withSuccessHandler(function(res) {
+        setAnswerButtonsBusy(false);
+        if (!res.success) { showToast(res.message||'Erreur','error'); return; }
+        App.answers[App.currentQ]={ userIndex:index, correctIndex:res.correctIndex, isOk:res.correct, pts:res.pts };
+        if (res.correct) { App.scoreLive+=res.pts; showToast('+'+res.pts+' pts 🎉','success'); }
+        else showToast('Raté… La bonne réponse s\'affiche.','error');
+        renderQuestion();
+      })
+      .withFailureHandler(function(err) { setAnswerButtonsBusy(false); showToast('Erreur: '+err.message,'error'); })
+      .checkAnswer({quizSessionId:App.quizSessionId, questionId:q.id, answerIndex:index, niveau:q.niveau});
+  });
 }
 
 function nextQuestion() {
@@ -2156,6 +2209,47 @@ function removeFriendConfirm(userId, username) {
 // ════════════════════════════════════════════════════════
 // INIT
 // ════════════════════════════════════════════════════════
+// ── CONNEXION AVEC GOOGLE ────────────────────────────────────
+// Remplace par le MÊME Client ID que côté serveur (Code.gs).
+var GOOGLE_CLIENT_ID = '267955489481-hhkjm7jlfaul1ukn2vankge1d74j16bj.apps.googleusercontent.com';
+
+function initGoogleSignIn() {
+  if (!window.google || !window.google.accounts || !window.google.accounts.id) {
+    setTimeout(initGoogleSignIn, 300); // le script GSI charge en async, on réessaie
+    return;
+  }
+  google.accounts.id.initialize({
+    client_id: GOOGLE_CLIENT_ID,
+    callback: handleGoogleCredential
+  });
+  var btnContainer = document.getElementById('google-signin-btn');
+  if (btnContainer) {
+    google.accounts.id.renderButton(btnContainer, {
+      theme: 'filled_black', size: 'large', shape: 'pill', width: 280, text: 'continue_with'
+    });
+  }
+}
+
+function handleGoogleCredential(response) {
+  showLoader('Connexion avec Google…');
+  google.script.run
+    .withSuccessHandler(function(res) {
+      hideLoader();
+      if (!res.success) {
+        showToast(res.message||'Erreur de connexion Google','error');
+        return;
+      }
+      App.user=res.user;
+      if (res.token) saveToken(res.token);
+      showToast(res.isNewAccount ? 'Bienvenue ! Compte créé via Google 🎉' : 'Bon retour ! 👋','success');
+      showPage('dashboard');
+      trySyncPendingOfflineResults();
+      autoDownloadAllSubjectsInBackground();
+    })
+    .withFailureHandler(function(err) { hideLoader(); showToast('Erreur: '+err.message,'error'); })
+    .loginWithGoogle(response.credential);
+}
+
 (function init(){
   var savedTheme=localStorage.getItem('n9_theme');
   if (savedTheme) {
@@ -2164,6 +2258,7 @@ function removeFriendConfirm(userId, username) {
     if (btn) { document.querySelectorAll('.theme-btn').forEach(function(b) { b.classList.remove('active'); btn.classList.add('active'); }); }
   }
   checkSession();
+  initGoogleSignIn();
 })();</script>
 </body>
 </html>
