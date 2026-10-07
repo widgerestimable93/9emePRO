@@ -436,6 +436,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
     <div class="home-buttons">
       <button class="btn btn-accent" onclick="showPage('auth','register')">🚀 Commencer</button>
       <button class="btn btn-outline" onclick="showPage('auth','login')">Connexion</button>
+      <button class="btn btn-outline" onclick="enterLocalMode()">📴 Jouer sans connexion</button>
     </div>
     <div class="home-features">
       <div class="home-feat"><div class="icon">📖</div><div class="label">11 matières</div></div>
@@ -903,7 +904,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
 
 <script>
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('./sw.js').catch(function(e){ console.warn('SW non enregistre:', e); });
+  navigator.serviceWorker.register('./sw.js').then(function(reg){ reg.update(); }).catch(function(e){ console.warn('SW non enregistre:', e); });
 }
 
 // ════════════════════════════════════════════════════════
@@ -1005,7 +1006,7 @@ var App = {
 App.offlineMode = false; // true pendant une session de quiz jouée hors-ligne
 
 var DB_NAME = '9emePRO_offline';
-var DB_VERSION = 1;
+var DB_VERSION = 2;
 var STORE_QUIZ = 'quiz_packs';
 var STORE_PENDING = 'pending_results';
 
@@ -1016,6 +1017,7 @@ function openOfflineDB() {
       var db = event.target.result;
       if (!db.objectStoreNames.contains(STORE_QUIZ)) db.createObjectStore(STORE_QUIZ, { keyPath: 'matiere' });
       if (!db.objectStoreNames.contains(STORE_PENDING)) db.createObjectStore(STORE_PENDING, { keyPath: 'localId' });
+      if (!db.objectStoreNames.contains('bank')) db.createObjectStore('bank', { keyPath: 'key' });
     };
     request.onsuccess = function (e) { resolve(e.target.result); };
     request.onerror = function (e) { reject(e.target.error); };
@@ -1393,7 +1395,7 @@ function refreshDashboard() {
   // ce qu'on a, puis recalculé avec le statut "mode gratuit" à jour —
   // car la session en cache peut être obsolète quelques minutes).
   function applyAccess(freeMode) {
-    var isP=u.is_premium||u.role==='admin'||!!freeMode;
+    var isP=u.is_premium||u.role==='admin'||!!freeMode||LOCAL_BANK_FREE||App.localMode;
     document.getElementById('premium-wall-dash').style.display=isP?'none':'block';
     document.getElementById('dash-body-content').style.display=isP?'block':'none';
     document.getElementById('free-mode-badge').style.display=freeMode?'inline-block':'none';
@@ -2249,6 +2251,393 @@ function handleGoogleCredential(response) {
     .withFailureHandler(function(err) { hideLoader(); showToast('Erreur: '+err.message,'error'); })
     .loginWithGoogle(response.credential);
 }
+
+// ════════════════════════════════════════════════════════
+// MODE 100 % HORS-LIGNE
+// Les questions viennent de ./questions.json (hébergé sur GitHub Pages,
+// mis en cache par sw.js puis copié dans IndexedDB). Le quiz, la
+// correction, l'historique, les erreurs, le streak et l'objectif du jour
+// fonctionnent sans aucun appel serveur. Le serveur ne sert plus qu'à
+// synchroniser les points (si connecté), au classement, aux amis, aux
+// examens PDF, au paiement et à l'IA.
+// ════════════════════════════════════════════════════════
+var QUESTIONS_URL   = './questions.json';
+var LOCAL_BANK_FREE = true;           // true = quiz local accessible à tous (pas de mur premium)
+var LOCAL_KEY       = 'n9_local_v1';  // stats locales
+var ONLINE_ONLY_PAGES = ['leaderboard','exams','ai','payment'];
+
+App.localMode = false;
+App._bank = null;
+App._bankPromise = null;
+
+// Les anciens packs serveur sont remplacés par la banque locale
+autoDownloadAllSubjectsInBackground = function(){};
+autoRefreshStaleSubjects = function(){};
+
+// ── Matières : alias → nom officiel ─────────────────────
+var _MAT_OFFICIELLES = ['Maths','Comm. Créole','Comm. Française','Sciences Expérimentales','Sciences Sociales','Anglais','Espagnol','Env. et Agriculture','EPS','Éducation Citoyenne','ETAP'];
+var _MAT_ALIAS = {
+  'mathematiques':'Maths','math':'Maths','communication creole':'Comm. Créole','comm creole':'Comm. Créole','creole':'Comm. Créole','kreyol':'Comm. Créole',
+  'communication francaise':'Comm. Française','comm francaise':'Comm. Française','francais':'Comm. Française',
+  'sciences exp':'Sciences Expérimentales','sc exp':'Sciences Expérimentales','physique-chimie-svt':'Sciences Expérimentales',
+  'sc sociales':'Sciences Sociales','sc.sociales':'Sciences Sociales','english':'Anglais','espanol':'Espagnol',
+  'environnement et agriculture':'Env. et Agriculture','env et agriculture':'Env. et Agriculture','agriculture':'Env. et Agriculture',
+  'education physique':'EPS','education physique et sportive':'EPS','education citoyenne':'Éducation Citoyenne','education a la citoyennete':'Éducation Citoyenne','ec':'Éducation Citoyenne',
+  'education technologique':'ETAP','education technologique et artistique':'ETAP'
+};
+function _stripAcc(s){ return String(s==null?'':s).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/\./g,'').replace(/\s+/g,' ').trim(); }
+function _normMat(m) {
+  var k=_stripAcc(m);
+  for (var i=0;i<_MAT_OFFICIELLES.length;i++) if (_stripAcc(_MAT_OFFICIELLES[i])===k) return _MAT_OFFICIELLES[i];
+  return _MAT_ALIAS[k]||_MAT_ALIAS[String(m||'').toLowerCase().trim()]||'';
+}
+
+// ── Normalisation de questions.json ─────────────────────
+// Accepte : [ {...} ] ou { questions:[...] } ; bonne_reponse 1-4,
+// correctIndex 0-3, ou texte de la bonne réponse ; choix[] ou choix1..4.
+function _hashId(s){ var h=5381; for (var i=0;i<s.length;i++) h=((h<<5)+h+s.charCodeAt(i))|0; return 'q'+(h>>>0).toString(36); }
+function _normBank(raw) {
+  var arr=Array.isArray(raw)?raw:((raw&&(raw.questions||raw.data))||[]);
+  var out=[], skipped=0, seen={};
+  arr.forEach(function(q) {
+    if (!q||typeof q!=='object') { skipped++; return; }
+    var question=String(q.question||'').trim();
+    var ch=Array.isArray(q.choix)?q.choix:(Array.isArray(q.options)?q.options:[q.choix1||q.c1,q.choix2||q.c2,q.choix3||q.c3,q.choix4||q.c4]);
+    ch=ch.map(function(c){ return String(c==null?'':c).trim(); });
+    var idx=-1;
+    if (q.correctIndex!==undefined&&q.correctIndex!==null&&q.correctIndex!=='') idx=parseInt(q.correctIndex,10);
+    else {
+      var r=(q.bonne_reponse!==undefined?q.bonne_reponse:q.rep);
+      if (r!==undefined&&r!==null&&String(r).trim()!=='') {
+        var rs=String(r).trim();
+        if (/^\d+$/.test(rs)) idx=parseInt(rs,10)-1;
+        else idx=ch.findIndex(function(c){ return c.toLowerCase()===rs.toLowerCase(); });
+      }
+    }
+    var mat=_normMat(q.matiere);
+    if (!question||ch.length<2||ch.some(function(c){return !c;})||!(idx>=0&&idx<ch.length)||!mat) { skipped++; return; }
+    var nv=String(q.niveau||q.level||'moyen').toLowerCase().trim();
+    nv=({easy:'facile',medium:'moyen',hard:'difficile',normal:'moyen'})[nv]||nv;
+    if (['facile','moyen','difficile'].indexOf(nv)<0) nv='moyen';
+    var id=q.id?String(q.id):_hashId(mat+'|'+question);
+    if (seen[id]) { skipped++; return; }
+    seen[id]=1;
+    out.push({ id:id, matiere:mat, niveau:nv, question:question, choix:ch, correctIndex:idx, explication:q.explication||q.explanation||'' });
+  });
+  if (skipped) console.warn('[banque] '+skipped+' question(s) ignorée(s) (format invalide ou doublon)');
+  return out;
+}
+
+// ── Explication enrichie (même rendu que le serveur) ────
+var _CONSEILS = {
+  'Maths':'💡 Mémorise la formule et vérifie avec des valeurs simples.',
+  'Comm. Créole':'📚 Li tèks la plizyè fwa epi reekri l nan pwòp mo w.',
+  'Comm. Française':'📝 Lis le texte attentivement, surligne les idées-clés.',
+  'Sciences Expérimentales':'🔬 Visualise la réaction ou le schéma. Relie théorie et expérience.',
+  'Sciences Sociales':'🌍 Associe le fait à une date et à une cause.',
+  'Anglais':'🇬🇧 Practice the key vocabulary in a sentence of your own.',
+  'Espagnol':'🇪🇸 Recuerda el vocabulario en contexto. Escribe una frase.',
+  'Env. et Agriculture':'🌿 Relie la notion à une réalité de ton environnement local.',
+  'EPS':'⚽ Mémorise les règles et les termes techniques.',
+  'Éducation Citoyenne':'🏛 Associe la règle de droit à un exemple de la vie quotidienne.',
+  'ETAP':'🔧 Retiens les étapes du processus technique ou artistique.'
+};
+var _DIFFS = { facile:'🟢 Concept de base', moyen:'🟡 Niveau intermédiaire', difficile:'🔴 Concept avancé' };
+function _richExpl(texte, matiere, niveau, bonneRep) {
+  if (texte&&typeof texte==='object') { if (!texte.bonneRep) texte.bonneRep=bonneRep; return texte; }
+  texte=String(texte||'').trim();
+  if (!texte) return { resume:'', points:[], formule:'', conseil:'', bonneRep:bonneRep, diffLabel:'' };
+  var sentences=texte.split(/(?<=[.!?])\s+/).map(function(s){return s.trim();}).filter(function(s){return s.length>3;});
+  var fm=texte.match(/[^.!?]*[=\u2192\u2248\u00b2\u00b3\u00d7\u00f7\u03a3\u222b\u221a][^.!?]*/);
+  return { resume:sentences[0]||texte, points:sentences.slice(1), formule:fm?fm[0].trim():'',
+           conseil:_CONSEILS[matiere]||'💡 Relis ce concept dans ton cours.', bonneRep:bonneRep, diffLabel:_DIFFS[niveau]||'' };
+}
+
+// ── Banque : IndexedDB d'abord (instantané), réseau en arrière-plan ──
+function _saveBankLocal(bank) {
+  return openOfflineDB().then(function(db) {
+    return new Promise(function(resolve) {
+      var tx=db.transaction('bank','readwrite');
+      tx.objectStore('bank').put({ key:'all', questions:bank, savedAt:new Date().toISOString() });
+      tx.oncomplete=resolve; tx.onerror=resolve;
+    });
+  }).catch(function(){});
+}
+function _readBankLocal() {
+  return openOfflineDB().then(function(db) {
+    return new Promise(function(resolve) {
+      var req=db.transaction('bank','readonly').objectStore('bank').get('all');
+      req.onsuccess=function(){ resolve(req.result&&req.result.questions||null); };
+      req.onerror=function(){ resolve(null); };
+    });
+  }).catch(function(){ return null; });
+}
+// Secours : anciens packs téléchargés via le serveur
+function _bankFromPacks() {
+  return openOfflineDB().then(function(db) {
+    return new Promise(function(resolve) {
+      var req=db.transaction(STORE_QUIZ,'readonly').objectStore(STORE_QUIZ).getAll();
+      req.onsuccess=function() {
+        var all=[]; (req.result||[]).forEach(function(p){ (p.questions||[]).forEach(function(q){ all.push(q); }); });
+        resolve(_normBank(all));
+      };
+      req.onerror=function(){ resolve([]); };
+    });
+  }).catch(function(){ return []; });
+}
+function _refreshBankFromNetwork(background) {
+  return fetch(QUESTIONS_URL,{cache:'no-cache'})
+    .then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+    .then(function(json) {
+      var b=_normBank(json);
+      if (!b.length) return null;
+      _saveBankLocal(b);
+      if (background) App._bank=b;
+      var prev=parseInt(localStorage.getItem('n9_bank_count')||'0',10);
+      if (prev!==b.length) { localStorage.setItem('n9_bank_count',String(b.length)); showToast('📥 '+b.length+' questions disponibles hors-ligne','success'); }
+      return b;
+    })
+    .catch(function(){ return null; });
+}
+function loadBank() {
+  if (App._bank) return Promise.resolve(App._bank);
+  if (App._bankPromise) return App._bankPromise;
+  App._bankPromise=_readBankLocal().then(function(local) {
+    if (local&&local.length) { App._bank=local; _refreshBankFromNetwork(true); return local; }
+    return _refreshBankFromNetwork(false).then(function(b){ return (b&&b.length)?b:_bankFromPacks(); });
+  }).then(function(b){ App._bank=b||[]; App._bankPromise=null; return App._bank; });
+  return App._bankPromise;
+}
+
+// ── Statistiques locales (localStorage) ─────────────────
+function _localData() {
+  var d=null; try { d=JSON.parse(localStorage.getItem(LOCAL_KEY)||'null'); } catch(e) {}
+  d=d||{};
+  d.username=d.username||'Élève'; d.score_total=d.score_total||0; d.streak=d.streak||0; d.lastDay=d.lastDay||'';
+  d.daily=d.daily||{date:'',pts:0}; d.history=d.history||[]; d.wrong=d.wrong||{}; d.seen=d.seen||{}; d.goal=d.goal||50;
+  return d;
+}
+function _saveLocal(d) { try { localStorage.setItem(LOCAL_KEY,JSON.stringify(d)); } catch(e) {} }
+function _pad2(n){ return ('0'+n).slice(-2); }
+function _dayStr(t){ t=t||new Date(); return t.getFullYear()+'-'+_pad2(t.getMonth()+1)+'-'+_pad2(t.getDate()); }
+function _localNiveau(score){ return score>=2500?'expert':score>=1000?'avance':score>=300?'intermediaire':'debutant'; }
+function _localUser() {
+  var d=_localData(), month=_dayStr().slice(0,7), m=0;
+  d.history.forEach(function(h){ if (String(h.date).slice(0,7)===month) m+=h.score||0; });
+  return { email:'eleve@hors-ligne', username:d.username, score_total:d.score_total, score_mensuel:m, streak:d.streak,
+           niveau:_localNiveau(d.score_total), is_premium:true, role:'user', local:true };
+}
+function _useLocal() { return App.localMode||!navigator.onLine||!App.token; }
+
+function _recordLocalResult(questions, answers, matiere) {
+  var d=_localData(), now=Date.now(), today=_dayStr(), correct=0, pts=0;
+  Object.keys(answers).forEach(function(k) {
+    var q=questions[parseInt(k,10)], a=answers[k]; if (!q||!a) return;
+    d.seen[q.id]=now;
+    if (a.isOk) {
+      correct++; pts+=a.pts||0;
+      if (d.wrong[q.id]) { d.wrong[q.id].box=(d.wrong[q.id].box||1)+1; if (d.wrong[q.id].box>=3) delete d.wrong[q.id]; }
+    } else {
+      var w=d.wrong[q.id]||{ ko:0, box:1 };
+      w.ko++; w.box=1; w.last=now; w.question=q.question; w.matiere=q.matiere; w.niveau=q.niveau;
+      d.wrong[q.id]=w;
+    }
+  });
+  var total=Object.keys(answers).length, t=new Date();
+  d.history.unshift({ date:_dayStr(t)+' '+_pad2(t.getHours())+':'+_pad2(t.getMinutes()), matiere:matiere==='toutes'?'Toutes':matiere, correct:correct, total:total, score:pts });
+  if (d.history.length>200) d.history.length=200;
+  d.score_total+=pts;
+  if (d.daily.date!==today) d.daily={date:today,pts:0};
+  d.daily.pts+=pts;
+  if (d.lastDay!==today) {
+    var y=new Date(); y.setDate(y.getDate()-1);
+    d.streak=(d.lastDay===_dayStr(y))?d.streak+1:1;
+    d.lastDay=today;
+  }
+  // limite la taille de "seen"
+  var ids=Object.keys(d.seen); if (ids.length>5000) ids.sort(function(a,b){return d.seen[a]-d.seen[b];}).slice(0,ids.length-5000).forEach(function(i){delete d.seen[i];});
+  _saveLocal(d);
+  return { correct:correct, total:total, pts:pts, scoreTotal:d.score_total };
+}
+
+// ── Lancer un quiz à partir de la banque locale ─────────
+function _startLocalQuiz(bank) {
+  var pool=bank.filter(function(q) {
+    return (App.quizMatiere==='toutes'||q.matiere===App.quizMatiere) && (App.quizNiveau==='tous'||q.niveau===App.quizNiveau);
+  });
+  if (!pool.length) { showToast('Aucune question pour ce choix (matière / difficulté).','error'); return false; }
+  var d=_localData();
+  // questions jamais vues ou les plus anciennes d'abord (tri stable après mélange)
+  pool=shuffleArray(pool).sort(function(a,b){ return (d.seen[a.id]||0)-(d.seen[b.id]||0); });
+  pool=pool.slice(0,Math.min(App.quizQty||10,pool.length));
+  App.questions=shuffleArray(pool).map(function(q) {
+    var correctText=q.choix[q.correctIndex];
+    return { id:q.id, matiere:q.matiere, niveau:q.niveau, question:q.question, choix:shuffleArray(q.choix),
+             _correctText:correctText, explication:_richExpl(q.explication,q.matiere,q.niveau,correctText) };
+  });
+  App.offlineMode=true; App.quizSessionId=null;
+  App.currentQ=0; App.answers={}; App.scoreLive=0;
+  showPage('quiz'); renderQuestion();
+  return true;
+}
+
+var _origLoadQuiz=loadQuiz;
+loadQuiz=function() {
+  showLoader('Préparation du quiz…');
+  loadBank().then(function(bank) {
+    hideLoader();
+    if (bank&&bank.length) _startLocalQuiz(bank);
+    else if (navigator.onLine&&App.token) _origLoadQuiz();
+    else showToast('Banque de questions introuvable. Ouvre l\'app une fois avec internet.','error');
+  });
+};
+
+// ── Fin de quiz (mode local) ────────────────────────────
+var _origFinishQuiz=finishQuiz;
+finishQuiz=function() {
+  if (!App.offlineMode) { _origFinishQuiz(); return; }
+  if (App.timerInterval) { clearInterval(App.timerInterval); App.timerInterval=null; }
+  var qs=App.questions, ans=App.answers, matiere=App.quizMatiere;
+  var answersOffline=Object.keys(ans).map(function(k){ return { questionId:qs[parseInt(k,10)].id, answerText:ans[k].answerText }; });
+  var stat=_recordLocalResult(qs,ans,matiere);
+  function show(syncPending) {
+    showPage('result');
+    var pct=stat.total?Math.round((stat.correct/stat.total)*100):0;
+    var icon=pct>=90?'🏆':pct>=70?'🎓':pct>=50?'📈':'💪';
+    document.getElementById('result-icon').textContent=icon;
+    document.getElementById('result-title').textContent=pct>=90?'Excellent !!':pct>=70?'Très bien !':pct>=50?'Pas mal !':'Continue !';
+    document.getElementById('result-pct').textContent=pct+'%';
+    document.getElementById('result-sub').textContent=stat.correct+'/'+stat.total+' correctes — '+(syncPending?'Points en attente de synchronisation 🔄':'Score total : '+stat.scoreTotal+' pts');
+    document.getElementById('res-correct').textContent=stat.correct;
+    document.getElementById('res-wrong').textContent=stat.total-stat.correct;
+    document.getElementById('res-pts').textContent=stat.pts;
+    if (syncPending) trySyncPendingOfflineResults();
+    App.offlineMode=false;
+  }
+  if (App.token&&!App.localMode) saveOfflineQuizResult(answersOffline,matiere,0).then(function(){ show(true); }).catch(function(){ show(false); });
+  else show(false);
+};
+
+// ── Pages alimentées localement ─────────────────────────
+var _origLoadHistory=loadHistory;
+loadHistory=function() {
+  if (!_useLocal()) { _origLoadHistory(); return; }
+  var list=document.getElementById('history-list'), h=_localData().history;
+  if (!h.length) { list.innerHTML='<div style="text-align:center;padding:40px;color:var(--text3)">Aucun résultat encore.<br>Lance ton premier quiz ! 🚀</div>'; return; }
+  var icons=EXAM_MATIERE_ICONS||{};
+  list.innerHTML=h.map(function(x) {
+    return '<div class="hist-item"><div class="hist-icon">'+(icons[x.matiere]||'📚')+'</div><div class="hist-info"><div class="hist-matiere">'+x.matiere+'</div>'
+      +'<div class="hist-date">'+x.date+' — '+x.correct+'/'+x.total+'</div></div><div class="hist-score">'+x.score+' pts</div></div>';
+  }).join('');
+};
+
+var _origLoadErrors=loadErrors;
+loadErrors=function() {
+  if (!_useLocal()) { _origLoadErrors(); return; }
+  var list=document.getElementById('errors-list'), w=_localData().wrong;
+  var arr=Object.keys(w).map(function(k){ return w[k]; }).sort(function(a,b){ return (b.ko-a.ko)||((b.last||0)-(a.last||0)); }).slice(0,30);
+  if (!arr.length) { list.innerHTML='<div style="text-align:center;padding:40px;color:var(--text3)">Aucune erreur récente ! Continue comme ça 🎉</div>'; return; }
+  list.innerHTML=arr.map(function(q) {
+    return '<div style="background:var(--card);border:1px solid var(--border2);border-radius:14px;padding:14px 16px;margin-bottom:10px">'
+      +'<div style="font-size:.7rem;font-weight:700;color:var(--err);margin-bottom:4px">'+q.matiere+' — Boîte Leitner : '+(q.box||1)+'</div>'
+      +'<div style="font-family:\'Syne\',sans-serif;font-weight:600;font-size:.9rem;color:var(--text);margin-bottom:8px">'+q.question+'</div>'
+      +'<div style="display:flex;gap:8px;font-size:.75rem"><span style="color:var(--err)">❌ '+q.ko+' fois ratée</span></div></div>';
+  }).join('');
+};
+
+var _origLoadDailyGoal=loadDailyGoal;
+loadDailyGoal=function() {
+  if (!_useLocal()) { _origLoadDailyGoal(); return; }
+  var d=_localData(), earned=(d.daily.date===_dayStr())?d.daily.pts:0, goal=d.goal||50;
+  document.getElementById('dg-count').textContent=earned+' / '+goal+' pts';
+  document.getElementById('dg-progress-fill').style.width=Math.min(100,Math.round(earned/goal*100))+'%';
+  document.getElementById('dg-done').style.display=earned>=goal?'block':'none';
+};
+
+var _origLoadProfile=loadProfile;
+loadProfile=function() {
+  if (!App.localMode) { _origLoadProfile(); return; }
+  var u=_localUser();
+  document.getElementById('profile-avatar').textContent=u.username[0].toUpperCase();
+  var nm=document.getElementById('profile-username');
+  nm.textContent=u.username+' ✏️'; nm.style.cursor='pointer';
+  nm.onclick=function() {
+    var v=prompt('Ton prénom :',u.username);
+    if (v&&v.trim()) { var d=_localData(); d.username=v.trim().slice(0,20); _saveLocal(d); App.user=_localUser(); loadProfile(); }
+  };
+  document.getElementById('profile-email').textContent='Mode hors-ligne — sans compte';
+  document.getElementById('ps-score-total').textContent=u.score_total;
+  document.getElementById('ps-score-mois').textContent=u.score_mensuel;
+  document.getElementById('ps-friends-count').textContent='—';
+  document.getElementById('monthly-leaderboard-list').innerHTML='<div style="text-align:center;padding:30px;color:var(--text3)">📶 Classement et amis : connecte-toi avec un compte.</div>';
+};
+
+// ── Navigation : sections en ligne seulement ────────────
+var _origShowPage=showPage;
+showPage=function(pageId, extra) {
+  if (ONLINE_ONLY_PAGES.indexOf(pageId)>=0&&(!navigator.onLine||App.localMode)) {
+    showToast(App.localMode?'📶 Section réservée aux comptes connectés.':'📶 Cette section nécessite internet.','info');
+    return;
+  }
+  if (pageId==='dashboard'&&App.localMode) App.user=_localUser();
+  _origShowPage(pageId,extra);
+  if (pageId==='dashboard'&&App.user&&!App.localMode) { try { localStorage.setItem('n9_user',JSON.stringify(App.user)); } catch(e) {} }
+};
+
+// ── Mode sans compte ────────────────────────────────────
+function enterLocalMode() {
+  App.localMode=true;
+  try { localStorage.setItem('n9_localmode','1'); } catch(e) {}
+  App.user=_localUser();
+  loadBank();
+  showPage('dashboard');
+}
+var _origDoLogout=doLogout;
+doLogout=function() {
+  if (App.localMode) {
+    App.localMode=false; App.user=null;
+    try { localStorage.removeItem('n9_localmode'); } catch(e) {}
+    closeSettings(); showPage('home'); return;
+  }
+  try { localStorage.removeItem('n9_user'); } catch(e) {}
+  _origDoLogout();
+};
+var _origSaveToken=saveToken;
+saveToken=function(t) { App.localMode=false; try { localStorage.removeItem('n9_localmode'); } catch(e) {} _origSaveToken(t); };
+
+// ── Démarrage : jamais bloqué par le réseau ─────────────
+checkSession=function() {
+  var splash=document.getElementById('session-check');
+  function hide(){ splash.classList.add('hidden'); }
+  loadBank(); // précharge la banque
+  var cached=null; try { cached=JSON.parse(localStorage.getItem('n9_user')||'null'); } catch(e) {}
+  if (!App.token) {
+    hide();
+    if (localStorage.getItem('n9_localmode')==='1') enterLocalMode();
+    return;
+  }
+  function useCached(msg) {
+    hide();
+    if (cached&&cached.email) { App.user=cached; showPage('dashboard'); if (msg) showToast(msg,'info'); }
+    else enterLocalMode();
+  }
+  if (!navigator.onLine) { useCached('📴 Mode hors-ligne'); return; }
+  var done=false;
+  var guard=setTimeout(function(){ if (done) return; done=true; useCached('📴 Connexion lente : mode hors-ligne'); },6000);
+  google.script.run
+    .withSuccessHandler(function(res) {
+      if (done) return; done=true; clearTimeout(guard); hide();
+      if (res&&res.success&&res.user) {
+        App.user=res.user; showPage('dashboard');
+        showToast('Bon retour, '+res.user.email.split('@')[0]+' ! 👋','success');
+        trySyncPendingOfflineResults();
+      } else { clearToken(); }   // session expirée → écran d'accueil
+    })
+    .withFailureHandler(function() { if (done) return; done=true; clearTimeout(guard); useCached('📴 Serveur injoignable : mode hors-ligne'); })
+    .validateSession(App.token);
+};
+
+window.addEventListener('offline', function(){ showToast('📴 Hors-ligne : le quiz continue de fonctionner','info'); });
 
 (function init(){
   var savedTheme=localStorage.getItem('n9_theme');
