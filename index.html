@@ -2678,11 +2678,15 @@ window.addEventListener('offline', function(){ showToast('📴 Hors-ligne : le q
   async function disableReminder(registration) {
     const sub = registration && await registration.pushManager.getSubscription();
     if (sub) {
-      await fetch(API + '/subscribe', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'unsubscribe', endpoint: sub.endpoint })
-      });
+      try {
+        await fetch(API + '/subscribe', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'unsubscribe', endpoint: sub.endpoint })
+        });
+      } catch (error) {
+        console.error('[rappel 9emePRO] Suppression serveur impossible', error);
+      }
       await sub.unsubscribe();
     }
     localStorage.removeItem(STORAGE_KEY);
