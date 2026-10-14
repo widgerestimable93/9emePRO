@@ -421,6 +421,11 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
       </div>
     </div>
     <div>
+      <div class="sp-section-label">Rappel quotidien</div>
+      <button class="btn btn-outline btn-sm" id="n9-reminder-settings" type="button" onclick="toggleN9DailyReminder()" style="width:100%">🔔 Activer le rappel de 17 h</button>
+      <div class="sp-info" style="margin-top:10px">Rappel chaque jour à 17 h, heure d’Haïti, même lorsque l’application est fermée. Sur iPhone/iPad, ajoute d’abord 9emePRO à l’écran d’accueil.</div>
+    </div>
+    <div>
       <div class="sp-section-label">Compte</div>
       <button class="btn btn-outline btn-sm" style="width:100%" onclick="doLogout()">🚪 Se déconnecter</button>
     </div>
@@ -438,6 +443,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
       <button class="btn btn-outline" onclick="showPage('auth','login')">Connexion</button>
       <button class="btn btn-outline" onclick="enterLocalMode()">📴 Jouer sans connexion</button>
     </div>
+    <button class="btn btn-outline" id="n9-reminder-home" type="button" onclick="toggleN9DailyReminder()" style="max-width:340px;margin:0 auto 18px">🔔 Activer le rappel de 17 h</button>
     <div class="home-features">
       <div class="home-feat"><div class="icon">📖</div><div class="label">11 matières</div></div>
       <div class="home-feat"><div class="icon">🧠</div><div class="label">Système Leitner</div></div>
@@ -2649,5 +2655,96 @@ window.addEventListener('offline', function(){ showToast('📴 Hors-ligne : le q
   checkSession();
   initGoogleSignIn();
 })();</script>
+
+<script>
+(function () {
+  const API = 'https://us-central1-baccpro-app.cloudfunctions.net/pushApi';
+  const STORAGE_KEY = '9emepro_webpush_enabled';
+
+  function base64ToBytes(value) {
+    const padding = '='.repeat((4 - value.length % 4) % 4);
+    const raw = atob((value + padding).replace(/-/g, '+').replace(/_/g, '/'));
+    return Uint8Array.from(raw, function (c) { return c.charCodeAt(0); });
+  }
+
+  function updateButtons(enabled) {
+    const label = enabled ? '✅ Rappel de 17 h activé (toucher pour désactiver)' : '🔔 Activer le rappel de 17 h';
+    ['n9-reminder-home', 'n9-reminder-settings'].forEach(function (id) {
+      const button = document.getElementById(id);
+      if (button) button.textContent = label;
+    });
+  }
+
+  async function disableReminder(registration) {
+    const sub = registration && await registration.pushManager.getSubscription();
+    if (sub) {
+      await fetch(API + '/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'unsubscribe', endpoint: sub.endpoint })
+      });
+      await sub.unsubscribe();
+    }
+    localStorage.removeItem(STORAGE_KEY);
+    updateButtons(false);
+    showToast('Rappel quotidien désactivé.', 'info');
+  }
+
+  window.toggleN9DailyReminder = async function () {
+    const enabled = localStorage.getItem(STORAGE_KEY) === '1';
+    try {
+      const registration = await navigator.serviceWorker.ready;
+      if (enabled) {
+        await disableReminder(registration);
+        return;
+      }
+      if (!('Notification' in window) || !('PushManager' in window)) {
+        showToast('Les rappels push ne sont pas compatibles avec ce navigateur.', 'error');
+        return;
+      }
+      const isAppleMobile = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+      const isInstalled = window.navigator.standalone === true
+        || window.matchMedia('(display-mode: standalone)').matches;
+      if (isAppleMobile && !isInstalled) {
+        showToast('Ajoute 9emePRO à l’écran d’accueil, ouvre cette icône, puis active le rappel.', 'info');
+        return;
+      }
+      if (Notification.permission !== 'granted') {
+        const permission = await Notification.requestPermission();
+        if (permission !== 'granted') {
+          showToast('Autorise les notifications pour recevoir le rappel de 17 h.', 'error');
+          return;
+        }
+      }
+      let subscription = await registration.pushManager.getSubscription();
+      if (!subscription) {
+        const keyResponse = await fetch(API + '/public-key', { cache: 'no-store' });
+        if (!keyResponse.ok) throw new Error('Clé push indisponible');
+        const result = await keyResponse.json();
+        if (!result.publicKey) throw new Error('Clé push non configurée');
+        subscription = await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: base64ToBytes(result.publicKey)
+        });
+      }
+      const response = await fetch(API + '/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'subscribe', app: '9emePRO', subscription: subscription.toJSON() })
+      });
+      if (!response.ok) throw new Error('Enregistrement du rappel impossible');
+      localStorage.setItem(STORAGE_KEY, '1');
+      updateButtons(true);
+      showToast('Rappel quotidien activé pour 17 h, heure d’Haïti.', 'success');
+    } catch (error) {
+      console.error('[rappel 9emePRO] Activation impossible', error);
+      showToast('Le service de rappels n’est pas encore déployé ou la connexion a échoué.', 'error');
+    }
+  };
+
+  updateButtons(localStorage.getItem(STORAGE_KEY) === '1');
+})();
+</script>
+
 </body>
 </html>
