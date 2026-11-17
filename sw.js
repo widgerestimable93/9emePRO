@@ -4,7 +4,7 @@
 //  • questions.json  : réseau d'abord (5 s max) puis cache → toujours à jour quand internet est là
 //  • autres fichiers : cache d'abord + mise à jour en arrière-plan
 //  • Apps Script, Google Sign-In, APK : jamais interceptés
-const VERSION = '9emepro-v3';
+const VERSION = '9emepro-v4';
 const SHELL = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png', './questions.json', './terms.html'];
 
 self.addEventListener('install', function (e) {
