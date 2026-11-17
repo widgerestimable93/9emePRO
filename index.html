@@ -4,6 +4,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <meta name="theme-color" content="#0A1A0F">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
 <title>9emePRO</title>
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
@@ -383,6 +386,11 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
   transition:transform .2s;-webkit-tap-highlight-color:transparent;
 }
 .btn-whatsapp:active{transform:scale(.97)}
+.pwa-install-button{position:fixed;left:16px;bottom:calc(16px + env(safe-area-inset-bottom,0px));z-index:420;display:flex;align-items:center;gap:8px;padding:12px 16px;border:0;border-radius:999px;background:linear-gradient(135deg,var(--blue),var(--accent));color:#fff;font-family:'Syne',sans-serif;font-weight:700;font-size:.88rem;box-shadow:0 6px 22px rgba(0,0,0,.35);cursor:pointer;-webkit-tap-highlight-color:transparent}
+.pwa-install-button:active{transform:scale(.97)}
+.pwa-install-button[hidden],.pwa-install-hint[hidden]{display:none!important}
+.pwa-install-hint{position:fixed;left:16px;bottom:calc(76px + env(safe-area-inset-bottom,0px));z-index:421;width:min(340px,calc(100vw - 32px));padding:16px;background:var(--bg2);border:1px solid var(--border2);border-radius:14px;color:var(--text);box-shadow:var(--shadow);font-size:.9rem;line-height:1.5}
+.pwa-install-hint button{margin-top:10px;padding:7px 12px;border:1px solid var(--border2);border-radius:8px;background:transparent;color:var(--text);cursor:pointer}
 </style>
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
@@ -396,6 +404,11 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
 
 <!-- Toast -->
 <div id="toast"></div>
+<button class="pwa-install-button" id="pwa-install-button" type="button" aria-label="Installer 9emePRO">📲 Installer 9emePRO</button>
+<div class="pwa-install-hint" id="pwa-install-hint" role="status" hidden>
+  <div id="pwa-install-hint-text"></div>
+  <button type="button" id="pwa-install-hint-close">Fermer</button>
+</div>
 <!-- Loader -->
 <div id="loader"><div class="loader-spinner"></div><div class="loader-text" id="loader-text">Chargement…</div></div>
 
@@ -908,6 +921,57 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
 </div>
 
 <script>
+(function () {
+  var button = document.getElementById('pwa-install-button');
+  var hint = document.getElementById('pwa-install-hint');
+  var hintText = document.getElementById('pwa-install-hint-text');
+  var closeHint = document.getElementById('pwa-install-hint-close');
+  var deferredPrompt = null;
+  if (!button || !hint || !hintText) return;
+
+  function isInstalled() {
+    return (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches)
+      || window.navigator.standalone === true;
+  }
+  if (isInstalled()) button.hidden = true;
+
+  window.addEventListener('beforeinstallprompt', function (event) {
+    event.preventDefault();
+    deferredPrompt = event;
+  });
+
+  button.addEventListener('click', async function () {
+    if (deferredPrompt) {
+      var promptEvent = deferredPrompt;
+      deferredPrompt = null;
+      await promptEvent.prompt();
+      var choice = await promptEvent.userChoice;
+      if (choice && choice.outcome === 'accepted') {
+        button.hidden = true;
+        hint.hidden = true;
+        return;
+      }
+    }
+
+    var ua = navigator.userAgent || '';
+    if (/iphone|ipad|ipod/i.test(ua)) {
+      hintText.textContent = 'Pour installer 9emePRO : touche Partager dans Safari, puis « Sur l’écran d’accueil ». Ouvre ensuite l’application une fois avec Internet pour préparer le mode hors ligne.';
+    } else if (/android/i.test(ua)) {
+      hintText.textContent = 'Pour installer 9emePRO : ouvre le menu ⋮ du navigateur, puis choisis « Installer l’application » ou « Ajouter à l’écran d’accueil ». Ouvre-la une fois avec Internet pour préparer le mode hors ligne.';
+    } else {
+      hintText.textContent = 'Dans Chrome ou Edge, utilise l’icône Installer dans la barre d’adresse, ou le menu du navigateur → Installer 9emePRO. Ouvre l’application une fois en ligne pour préparer le mode hors ligne.';
+    }
+    hint.hidden = false;
+  });
+
+  if (closeHint) closeHint.addEventListener('click', function () { hint.hidden = true; });
+  window.addEventListener('appinstalled', function () {
+    button.hidden = true;
+    hint.hidden = true;
+    deferredPrompt = null;
+  });
+})();
+
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('./sw.js').catch(function(e){ console.warn('SW non enregistre:', e); });
 }
